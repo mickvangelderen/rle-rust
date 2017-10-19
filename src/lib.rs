@@ -53,6 +53,12 @@ pub struct Encoder<R: io::Read> {
     input: R
 }
 
+impl<R: io::Read> Encoder<R> {
+    pub fn new(input: R) -> Self {
+        Encoder { input }
+    }
+}
+
 impl<R: io::Read> io::Read for Encoder<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         let mut buffer = Vec::with_capacity(output.len()/2);
@@ -81,30 +87,21 @@ mod tests {
 
         let input: Vec<u8> = vec![0, 0, 0, 0, 0, 3, 3, 3];
 
-        let mut enc = super::Encoder { input: &input[..] };
+        let mut encoder = super::Encoder::new(&input[..]);
 
-        let mut buf = vec![0xCC; 10];
+        let mut output = Vec::new();
 
-        assert_eq!(
-            enc.read(&mut buf).unwrap(),
-            2
-        );
+        loop {
+            let mut buf = vec![0xCC; 10];
 
-        assert_eq!(
-            &buf,
-            &[5, 0, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]
-        );
+            let bytes_read = encoder.read(&mut buf).unwrap();
 
-        let mut buf = vec![0xCC; 2];
-        assert_eq!(
-            enc.read(&mut buf).unwrap(),
-            2
-        );
+            if bytes_read == 0 { break; }
 
-        assert_eq!(
-            &buf,
-            &[1, 3]
-        );
+            output.write(&buf[..bytes_read]).unwrap();
+        }
+
+        assert_eq!(&output, &vec![5, 0, 3, 3]);
     }
 
     use std::io;
