@@ -1,23 +1,45 @@
+#![feature(read_initializer)]
+
 // Naive run length encoding.
 
 pub fn encode(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
 
-    let mut i = 0;
-    while i < input.len() {
-        let byte_i = input[i];
-
-        let mut j = i + 1;
-        while j < input.len() && (j - i) < 256 {
-            let byte_j = input[j];
-            if byte_j != byte_i { break }
-            j += 1;
-        }
-
-        output.push((j - i) as u8);
-        output.push(byte_i);
-        i = j;
+    if input.len() < 1 {
+        return output;
     }
+
+    let mut count = 1;
+    let mut byte = input[0];
+
+    for &cur_byte in &input[1..] {
+        if byte == cur_byte {
+            // Same byte, increment count.
+            count += 1;
+
+            // If we hit the maximum count.
+            if count == 255 {
+                // Write repetition.
+                output.push(count as u8);
+                output.push(byte);
+
+                // Reset count but the byte stays the same.
+                count = 1;
+            }
+        } else {
+            // Different byte, output repetition.
+            output.push(count as u8);
+            output.push(byte);
+
+            // Reset count and change byte.
+            count = 1;
+            byte = cur_byte;
+        }
+    }
+
+    // Flush.
+    output.push(count as u8);
+    output.push(byte);
 
     output
 }
@@ -49,25 +71,163 @@ pub fn encode_into(input: &[u8], output: &mut [u8]) -> usize {
 
 use std::io;
 
+#[derive(Debug)]
 pub struct Encoder<R: io::Read> {
-    input: R
+    input: R,
+    buffer: Box<[u8]>,
+    start: usize,
+    end: usize,
+    state: Option<(usize, u8)>,
+    output_buffer: [u8; 2],
+    output_buffer_count: u8,
 }
 
+
+
 impl<R: io::Read> Encoder<R> {
-    pub fn new(input: R) -> Self {
-        Encoder { input }
+    pub fn with_capacity(capacity: usize, input: R) -> Self {
+        let mut buffer = Vec::with_capacity(capacity);
+        unsafe {
+            buffer.set_len(capacity);
+            input.initializer().initialize(&mut buffer);
+        }
+        Encoder {
+            input,
+            buffer: buffer.into_boxed_slice(),
+            start: 0,
+            end: 0,
+            state: None,
+            output_buffer: unsafe { std::mem::uninitialized() },
+            output_buffer_count: 0,
+        }
     }
 }
 
 impl<R: io::Read> io::Read for Encoder<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        let mut buffer = Vec::with_capacity(output.len()/2);
-        unsafe { buffer.set_len(output.len()/2) };
+        let mut oi = 0;
 
-        let bytes_read = self.input.read(&mut buffer)?;
-        unsafe { buffer.set_len(bytes_read); }
+        // Emit any buffered output data.
+        while oi < output.len() && oi < self.output_buffer_count as usize {
+            output[oi] = self.output_buffer[oi];
+            oi += 1;
+        }
 
-        Ok(encode_into(&buffer, output))
+        // Subtract number of bytes written from the amount of buffered output data.
+        self.output_buffer_count -= oi as u8;
+
+        // If the output buffer is not empty there is no need to continue.
+        if self.output_buffer_count > 0 {
+            return Ok(oi);
+        }
+
+        // TODO: We can decide to keep reading and processing until the output
+        // buffer is full.
+
+        // Check if we ran out of input data.
+        if self.start == self.end {
+            // Update end and then start only if read succeeds.
+            self.end = self.input.read(&mut self.buffer)?;
+            self.start = 0;
+        }
+        println!("{:?} {:?}", self.start, self.end);
+
+
+        if self.start < self.end {
+
+            // Initialize the state.
+            let (mut count, mut byte) = if let Some((count, byte)) = self.state {
+                // We have left overs from last time.
+                self.state = None;
+                (count, byte)
+            } else {
+                // We can use the first byte of the input to initialize the
+                // state. We know that there is at least one byte since
+                // self.start < self.end
+                let ret = (1, self.buffer[self.start]);
+                self.start += 1;
+                ret
+            };
+
+            while self.start < self.end {
+                let cur_byte = self.buffer[self.start];
+
+                if cur_byte == byte {
+                    count += 1;
+
+                    if count == 255 {
+                        if oi < output.len() {
+                            output[oi] = count as u8;
+                            oi += 1;
+                        } else {
+                            self.output_buffer[0] = count as u8;
+                            self.output_buffer[1] = byte;
+                            self.output_buffer_count = 2;
+                            break;
+                        }
+                        if oi < output.len() {
+                            output[oi] = byte;
+                            oi += 1;
+                        } else {
+                            self.output_buffer[0] = byte;
+                            self.output_buffer_count = 1;
+                            break;
+                        }
+
+                        count = 1;
+                    }
+                } else {
+                    if oi < output.len() {
+                        output[oi] = count as u8;
+                        oi += 1;
+                    } else {
+                        self.output_buffer[0] = count as u8;
+                        self.output_buffer[1] = byte;
+                        self.output_buffer_count = 2;
+                        break;
+                    }
+                    if oi < output.len() {
+                        output[oi] = byte;
+                        oi += 1;
+                    } else {
+                        self.output_buffer[0] = byte;
+                        self.output_buffer_count = 1;
+                        break;
+                    }
+
+                    count = 1;
+                    byte = cur_byte;
+                }
+
+                self.start += 1;
+            }
+
+            // Save the state.
+            self.state = Some((count, byte));
+        } else {
+            // Flush the remaining state if it's there.
+            if let Some((count, byte)) = self.state {
+                if oi < output.len() {
+                    output[oi] = count as u8;
+                    oi += 1;
+                } else {
+                    self.output_buffer[0] = count as u8;
+                    self.output_buffer[1] = byte;
+                    self.output_buffer_count = 2;
+                    return Ok(oi);
+                }
+                if oi < output.len() {
+                    output[oi] = byte;
+                    oi += 1;
+                } else {
+                    self.output_buffer[0] = byte;
+                    self.output_buffer_count = 1;
+                    return Ok(oi);
+                }
+            }
+        }
+
+        Ok(oi)
     }
 }
 
@@ -87,7 +247,7 @@ mod tests {
 
         let input: Vec<u8> = vec![0, 0, 0, 0, 0, 3, 3, 3];
 
-        let mut encoder = super::Encoder::new(&input[..]);
+        let mut encoder = super::Encoder::with_capacity(10, &input[..]);
 
         let mut output = Vec::new();
 
@@ -95,6 +255,8 @@ mod tests {
             let mut buf = vec![0xCC; 10];
 
             let bytes_read = encoder.read(&mut buf).unwrap();
+
+            println!("{:?}", &buf[..bytes_read]);
 
             if bytes_read == 0 { break; }
 
